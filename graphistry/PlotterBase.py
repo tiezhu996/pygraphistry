@@ -59,6 +59,7 @@ from .bolt_util import (
     to_bolt_driver)
 
 from .arrow_uploader import ArrowUploader
+from .upload_session import DEFAULT_CHUNK_SIZE_MB
 from .kepler import KeplerDataset, KeplerLayer, KeplerOptions, KeplerConfig, KeplerEncoding
 from .nodexlistry import NodeXLGraphistry
 from .tigeristry import Tigeristry
@@ -2327,7 +2328,9 @@ class PlotterBase(Plottable):
         erase_files_on_fail: bool = True,
         validate: ValidationParam = 'autofix',
         warn: bool = True,
-        schema_validate: SchemaValidationParam = False
+        schema_validate: SchemaValidationParam = False,
+        resumable: bool = False,
+        chunk_size_mb: int = DEFAULT_CHUNK_SIZE_MB
     ) -> Plottable:
         """Upload data to the Graphistry server and return as a Plottable. Headless-centric variant of plot().
 
@@ -2353,6 +2356,18 @@ class PlotterBase(Plottable):
                                 declared columns. 'autofix' casts compatible columns to declared Arrow types.
         :type schema_validate: SchemaValidationParam
 
+        :param resumable: Upload through a resumable transaction: data is staged in
+                          independent chunks and the new dataset is created only after every
+                          chunk uploads and validates, so a network failure never disturbs the
+                          previously uploaded dataset. On a transport failure the raised
+                          ``ResumableUploadError`` exposes ``.session``; call
+                          ``session.resume()`` to continue from the last confirmed chunk or
+                          ``session.cancel()`` to abandon. Default False (legacy whole-table upload).
+        :type resumable: bool
+
+        :param chunk_size_mb: Target size per staging chunk when ``resumable=True``. Default 64.
+        :type chunk_size_mb: int
+
         **Example: Simple**
             ::
 
@@ -2363,6 +2378,14 @@ class PlotterBase(Plottable):
                     .edges(es)
                 g2 = g1.upload()
                 print(f'dataset id: {g2._dataset_id}, url: {g2._url}')
+
+        **Example: Resumable upload over an unreliable network**
+            ::
+
+                try:
+                    g2 = g1.upload(resumable=True)
+                except graphistry.ResumableUploadError as e:
+                    g2 = e.session.resume()  # or e.session.cancel()
         """
         return self.plot(
             render='g',
@@ -2371,7 +2394,9 @@ class PlotterBase(Plottable):
             erase_files_on_fail=erase_files_on_fail,
             validate=validate,
             warn=warn,
-            schema_validate=schema_validate
+            schema_validate=schema_validate,
+            resumable=resumable,
+            chunk_size_mb=chunk_size_mb
         )
 
     @otel_traced("graphistry.plot", attrs_fn=_plot_otel_attrs)
@@ -2390,7 +2415,9 @@ class PlotterBase(Plottable):
         override_html_style: Optional[str] = None,
         validate: ValidationParam = 'autofix',
         warn: bool = True,
-        schema_validate: SchemaValidationParam = False
+        schema_validate: SchemaValidationParam = False,
+        resumable: bool = False,
+        chunk_size_mb: int = DEFAULT_CHUNK_SIZE_MB
     ) -> Any:
         """Upload data to the Graphistry server and show as an iframe of it.
 
@@ -2442,6 +2469,15 @@ class PlotterBase(Plottable):
                                 False disables schema enforcement. True/'strict' rejects missing or incompatible
                                 declared columns. 'autofix' casts compatible columns to declared Arrow types.
         :type schema_validate: SchemaValidationParam
+
+        :param resumable: Stage data in resumable chunks and create the dataset only once,
+                          after all chunks validate; requires ``as_files=True``. On a transport
+                          failure, catch ``ResumableUploadError`` and call ``e.session.resume()``.
+                          Default False.
+        :type resumable: bool
+
+        :param chunk_size_mb: Target size per staging chunk when ``resumable=True``. Default 64.
+        :type chunk_size_mb: int
 
         **Example: Simple**
             ::
@@ -2510,6 +2546,36 @@ class PlotterBase(Plottable):
         if skip_upload:
             return uploader
         uploader.token = self.session.api_token  # type: ignore[assignment]
+
+        finalize_kwargs: Dict[str, Any] = dict(
+            render=render,
+            name=name,
+            description=description,
+            as_files=as_files,
+            extra_html=extra_html,
+            override_html_style=override_html_style,
+            validate_mode=validate_mode,
+            warn=warn,
+        )
+
+        if resumable:
+            if not as_files:
+                raise ValueError(
+                    "resumable uploads require as_files=True; "
+                    "use upload() or plot(as_files=True, resumable=True)"
+                )
+            if chunk_size_mb <= 0:
+                raise ValueError("chunk_size_mb must be positive")
+            # Finalize binds the new dataset only after the transaction commits.
+            session = uploader.make_resumable_session(
+                chunk_size_mb=chunk_size_mb,
+                validate=validate_mode,
+                warn=warn,
+            )
+            return session.run(
+                finalize=lambda: self._finalize_upload(uploader, **finalize_kwargs)
+            )
+
         uploader.post(
             as_files=as_files,
             memoize=memoize,
@@ -2517,6 +2583,27 @@ class PlotterBase(Plottable):
             warn=warn,
             erase_files_on_fail=erase_files_on_fail
         )
+        return self._finalize_upload(uploader, **finalize_kwargs)
+
+    def _finalize_upload(
+        self,
+        uploader: ArrowUploader,
+        render: Optional[Union[bool, RenderModes]],
+        name: str,
+        description: str,
+        as_files: bool,
+        extra_html: str,
+        override_html_style: Optional[str],
+        validate_mode: ValidationMode,
+        warn: bool,
+    ) -> object:
+        """Post-commit tail: sharing, viz URL, and render-mode materialization.
+
+        Shared by the legacy and resumable upload paths. It is called only
+        after the dataset exists, and binds the new ids onto a *fresh* graph,
+        which is why a failed/cancelled resumable upload can never mutate the
+        caller's previously uploaded graph.
+        """
         uploader.maybe_post_share_link(self)
         info: DatasetInfo = {
             'name': uploader.dataset_id,
@@ -2545,21 +2632,19 @@ class PlotterBase(Plottable):
             webbrowser.open(full_url)
             return full_url
         elif render_mode == "g":
-            g = self.bind()
-            g._name = name
-            g._description = description
-            if uploader is not None:
-                g._dataset_id = uploader.dataset_id
-                if as_files:
-                    assert isinstance(uploader, ArrowUploader)
-                    try:
-                        g._nodes_file_id = uploader.nodes_file_id
-                    except:
-                        # tolerate undefined
-                        g._nodes_file_id = None
-                    g._edges_file_id = uploader.edges_file_id
-                g._url = full_url
-            return g
+            out = self.bind()
+            out._name = name
+            out._description = description
+            out._dataset_id = uploader.dataset_id
+            if as_files:
+                try:
+                    out._nodes_file_id = uploader.nodes_file_id
+                except:
+                    # tolerate undefined
+                    out._nodes_file_id = None
+                out._edges_file_id = uploader.edges_file_id
+            out._url = full_url
+            return out
         else:
             raise ValueError(f"Unexpected render mode resolution: {render_mode}")
 

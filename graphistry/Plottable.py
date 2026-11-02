@@ -909,6 +909,8 @@ class Plottable(Protocol):
         validate: ValidationParam = 'autofix',
         warn: bool = True,
         schema_validate: SchemaValidationParam = False,
+        resumable: bool = False,
+        chunk_size_mb: int = 64,
     ) -> 'Plottable':
         ...
 
@@ -928,6 +930,8 @@ class Plottable(Protocol):
         validate: ValidationParam = 'autofix',
         warn: bool = True,
         schema_validate: SchemaValidationParam = False,
+        resumable: bool = False,
+        chunk_size_mb: int = 64,
     ) -> Any:
         ...
 

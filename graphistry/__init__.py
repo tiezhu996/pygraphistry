@@ -76,6 +76,14 @@ from graphistry.pygraphistry import (  # noqa: E402, F401
     from_cugraph
 )
 
+from graphistry.upload_session import (  # noqa: F401
+    ResumableUploadSession,
+    ResumableUploadError,
+    UncertainCommitError,
+    UploadCancelledError,
+    UploadValidationError,
+)
+
 from graphistry.collections import (
     collection_set,
     collection_intersection,

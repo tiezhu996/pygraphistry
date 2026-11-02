@@ -119,6 +119,32 @@ class ArrowFileUploader():
             logger.error('Failed uploading file: %s', res.text, exc_info=True)
             raise e
 
+    def repost_arrow(
+        self,
+        arr: pa.Table,
+        file_id: str,
+        file_opts: Dict[str, object] = {},
+        upload_url_opts: str = 'erase=true'
+    ) -> Tuple[str, Dict[str, object]]:
+        """
+            Re-upload data to an existing file id, used by resumable uploads
+            after a lost response: re-posting with ``erase=true`` is idempotent.
+
+            If the file id no longer exists (definitive 404, e.g. the earlier
+            create never landed), create a fresh file and post to it instead.
+
+            Transport errors (connection/timeout) propagate for the caller to
+            classify as retryable; only a server-acknowledged 404 triggers
+            recreation, so a lost create response cannot duplicate a file.
+        """
+        try:
+            return file_id, self.post_arrow(arr, file_id, upload_url_opts)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                new_file_id = self.create_file(file_opts)
+                return new_file_id, self.post_arrow(arr, new_file_id, upload_url_opts)
+            raise
+
     ###
 
     def create_and_post_file(

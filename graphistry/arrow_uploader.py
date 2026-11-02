@@ -7,6 +7,7 @@ from graphistry.otel import inject_trace_headers
 
 from .client_session import ClientSession
 from .ArrowFileUploader import ArrowFileUploader
+from .upload_session import DEFAULT_CHUNK_SIZE_MB, ResumableUploadSession
 from .io.metadata import (
     serialize_node_bindings,
     serialize_edge_bindings,
@@ -102,6 +103,10 @@ class ArrowUploader:
         self.__org_name = org_name or self._client_session.org_name
 
         self.sso_auth_url: Optional[str] = None
+
+        # Populated only by the opt-in resumable upload transaction
+        self.resumable_edge_file_ids: Optional[List[str]] = None
+        self.resumable_node_file_ids: Optional[List[str]] = None
 
         logger.debug("2. @ArrowUploader.__init__: After set self.org_name: %s, self.__org_name : %s", self.org_name, self.__org_name)
     
@@ -700,6 +705,28 @@ class ArrowUploader:
 
         return self
 
+
+    def make_resumable_session(
+        self,
+        chunk_size_mb: float = DEFAULT_CHUNK_SIZE_MB,
+        validate: ValidationParam = 'autofix',
+        warn: bool = True,
+    ) -> ResumableUploadSession:
+        """Build a resumable, transactional upload session for this uploader.
+
+        The session stages edges/nodes as independent content-addressed chunks
+        and creates the dataset exactly once after all chunks validate, so a
+        failed or cancelled attempt never disturbs the live dataset.
+        """
+        if self.edges is None:
+            raise ValueError("edges table is None")
+        return ResumableUploadSession(
+            uploader=self,
+            file_uploader=ArrowFileUploader(self),
+            chunk_size_mb=chunk_size_mb,
+            validate=validate,
+            warn=warn,
+        )
 
     ###########################################
 
